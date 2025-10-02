@@ -1,0 +1,225 @@
+
+import React, { useState, useEffect, useCallback } from "react";
+import { Game, GamePlayer, GameMove } from "@/entities/all";
+import { User } from "@/entities/User";
+import { useNavigate } from "react-router-dom";
+import { createPageUrl } from "@/utils";
+import { Loader2, ArrowLeft } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import GameArena from "../components/game/GameArena";
+import GameControls from "../components/game/GameControls";
+import GameHistory from "../components/game/GameHistory";
+import WaitingRoom from "../components/game/WaitingRoom";
+import GameOverModal from "../components/game/GameOverModal";
+
+const WEAPONS = {
+  pistol: { name: "Pistol", damage: 25, accuracy: 0.75, icon: "🔫" },
+  rifle: { name: "Rifle", damage: 35, accuracy: 0.65, icon: "🔫" },
+  shotgun: { name: "Shotgun", damage: 50, accuracy: 0.50, icon: "💥" },
+  sniper: { name: "Sniper", damage: 75, accuracy: 0.40, icon: "🎯" }
+};
+
+export default function GameRoom() {
+  const [game, setGame] = useState(null);
+  const [players, setPlayers] = useState([]);
+  const [moves, setMoves] = useState([]);
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [selectedWeapon, setSelectedWeapon] = useState("pistol");
+  const [processing, setProcessing] = useState(false);
+  const [showGameOver, setShowGameOver] = useState(false);
+  const navigate = useNavigate();
+
+  const urlParams = new URLSearchParams(window.location.search);
+  const gameId = urlParams.get("id");
+
+  const loadUser = async () => {
+    const userData = await User.me();
+    setUser(userData);
+  };
+
+  const loadGameData = useCallback(async () => {
+    const gameData = await Game.get(gameId);
+    const playersData = await GamePlayer.filter({ game_id: gameId }, "-position");
+    const movesData = await GameMove.filter({ game_id: gameId }, "-created_date", 20);
+    
+    setGame(gameData);
+    setPlayers(playersData);
+    setMoves(movesData);
+    setLoading(false);
+
+    if (gameData.status === "finished" && !showGameOver) {
+      setShowGameOver(true);
+    }
+  }, [gameId, showGameOver]);
+
+  useEffect(() => {
+    loadUser();
+    loadGameData();
+    const interval = setInterval(loadGameData, 2000);
+    return () => clearInterval(interval);
+  }, [loadGameData]); // Now loadGameData is a stable function reference due to useCallback
+
+
+  const executeShot = async (targetPlayer) => {
+    if (!user || processing) return;
+    
+    setProcessing(true);
+
+    const currentPlayer = players.find(p => p.player_email === user.email);
+    const weapon = WEAPONS[selectedWeapon];
+    const hit = Math.random() < weapon.accuracy;
+    const damage = hit ? weapon.damage : 0;
+
+    const defendMultiplier = targetPlayer.is_defending ? 0.5 : 1;
+    const actualDamage = Math.floor(damage * defendMultiplier);
+    
+    await GameMove.create({
+      game_id: gameId,
+      player_email: user.email,
+      player_name: user.full_name,
+      action: "shoot",
+      weapon: selectedWeapon,
+      target_email: targetPlayer.player_email,
+      damage: actualDamage,
+      hit: hit,
+      round_number: game.round_number
+    });
+
+    const newHealth = Math.max(0, targetPlayer.health - actualDamage);
+    await GamePlayer.update(targetPlayer.id, { 
+      health: newHealth,
+      is_defending: false
+    });
+
+    if (actualDamage > 0) {
+      await GamePlayer.update(currentPlayer.id, {
+        damage_dealt: currentPlayer.damage_dealt + actualDamage
+      });
+    }
+
+    if (newHealth <= 0) {
+      await GamePlayer.update(currentPlayer.id, {
+        kills: currentPlayer.kills + 1
+      });
+      await GamePlayer.update(targetPlayer.id, {
+        deaths: targetPlayer.deaths + 1
+      });
+      await Game.update(gameId, {
+        status: "finished",
+        winner: user.email
+      });
+    } else {
+      const nextPlayerIndex = (players.findIndex(p => p.player_email === user.email) + 1) % players.length;
+      const nextPlayer = players[nextPlayerIndex];
+      
+      await Game.update(gameId, {
+        current_turn: nextPlayer.player_email,
+        round_number: game.round_number + 1
+      });
+    }
+
+    setProcessing(false);
+  };
+
+  const executeDefend = async () => {
+    if (!user || processing) return;
+    
+    setProcessing(true);
+
+    const currentPlayer = players.find(p => p.player_email === user.email);
+    
+    await GameMove.create({
+      game_id: gameId,
+      player_email: user.email,
+      player_name: user.full_name,
+      action: "defend",
+      round_number: game.round_number
+    });
+
+    await GamePlayer.update(currentPlayer.id, {
+      is_defending: true
+    });
+
+    const nextPlayerIndex = (players.findIndex(p => p.player_email === user.email) + 1) % players.length;
+    const nextPlayer = players[nextPlayerIndex];
+    
+    await Game.update(gameId, {
+      current_turn: nextPlayer.player_email,
+      round_number: game.round_number + 1
+    });
+
+    setProcessing(false);
+  };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <Loader2 className="w-8 h-8 animate-spin text-cyan-400" />
+      </div>
+    );
+  }
+
+  if (game.status === "waiting") {
+    return <WaitingRoom game={game} players={players} gameId={gameId} />;
+  }
+
+  const isMyTurn = game.current_turn === user?.email;
+  const currentPlayer = players.find(p => p.player_email === user?.email);
+  const opponent = players.find(p => p.player_email !== user?.email);
+
+  return (
+    <div className="min-h-screen p-4 md:p-8">
+      <div className="max-w-7xl mx-auto">
+        <div className="flex items-center justify-between mb-6">
+          <Button
+            variant="ghost"
+            onClick={() => navigate(createPageUrl("GameLobby"))}
+            className="text-gray-400 hover:text-white"
+          >
+            <ArrowLeft className="w-4 h-4 mr-2" />
+            Back to Lobby
+          </Button>
+          <div className="text-center">
+            <h2 className="text-2xl font-bold text-white">{game.name}</h2>
+            <p className="text-gray-400">Round {game.round_number}</p>
+          </div>
+          <div className="w-24"></div>
+        </div>
+
+        <div className="grid lg:grid-cols-3 gap-6">
+          <div className="lg:col-span-2 space-y-6">
+            <GameArena 
+              players={players}
+              currentPlayer={currentPlayer}
+              opponent={opponent}
+              isMyTurn={isMyTurn}
+            />
+            
+            <GameControls
+              isMyTurn={isMyTurn}
+              processing={processing}
+              selectedWeapon={selectedWeapon}
+              setSelectedWeapon={setSelectedWeapon}
+              weapons={WEAPONS}
+              onShoot={() => executeShot(opponent)}
+              onDefend={executeDefend}
+            />
+          </div>
+
+          <div>
+            <GameHistory moves={moves} />
+          </div>
+        </div>
+      </div>
+
+      <GameOverModal
+        open={showGameOver}
+        winner={game.winner}
+        players={players}
+        user={user}
+        onClose={() => navigate(createPageUrl("GameLobby"))}
+      />
+    </div>
+  );
+}
